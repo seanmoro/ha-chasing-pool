@@ -1,0 +1,55 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "CHASING Pool Robot",
+        "description": "Sign in with your CHASING / PoolMate account. The password is stored so Home Assistant can refresh the cloud session automatically if the mobile app signs you out. Logging in here may briefly sign out the app.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      },
+      "device": {
+        "title": "Select device",
+        "description": "Choose which CHASING pool robot to add.",
+        "data": {
+          "device_id": "Device"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate CHASING",
+        "description": "Your CHASING session expired or was replaced by the app. Sign in again to refresh MQTT credentials.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email or password",
+      "cannot_connect": "Failed to connect to CHASING cloud",
+      "no_devices_found": "No devices found on this account"
+    },
+    "abort": {
+      "already_configured": "Device is already configured",
+      "reauth_successful": "Re-authentication successful"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Refresh CHASING login",
+        "description": "Re-login to refresh the REST token and MQTT password, and store the password for automatic session refresh.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email or password",
+      "cannot_connect": "Failed to connect to CHASING cloud",
+      "no_devices_found": "No devices found on this account"
+    }
+  }
+}
