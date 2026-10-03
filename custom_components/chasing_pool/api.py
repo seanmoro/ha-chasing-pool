@@ -23,7 +23,14 @@ import paho.mqtt.client as mqtt
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from .const import MQTT_HOST, MQTT_PORT, MODE_RETRIEVE, REST_BASE_URL, TOPIC_PREFIX
+from .const import (
+    ERROR_CODE_FILTER_FULL,
+    MQTT_HOST,
+    MQTT_PORT,
+    MODE_RETRIEVE,
+    REST_BASE_URL,
+    TOPIC_PREFIX,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -97,6 +104,7 @@ class DeviceStatus:
     water_temperature: int
     fw_version: str
     light_strip: int
+    fault_alarm: int
 
     @classmethod
     def from_payload(cls, data: dict) -> "DeviceStatus":
@@ -113,7 +121,12 @@ class DeviceStatus:
             water_temperature=data.get("waterTemprature", 0),
             fw_version=data.get("fwVer", ""),
             light_strip=int(data.get("lightStrip", 0) or 0),
+            fault_alarm=int(data.get("faultAlarm", -1) or -1),
         )
+
+    @property
+    def filter_full_from_fault(self) -> bool:
+        return self.fault_alarm == ERROR_CODE_FILTER_FULL
 
     @property
     def is_returning(self) -> bool:
@@ -236,7 +249,8 @@ class ChasingRestClient:
 class ChasingMqttClient:
     """Wraps paho-mqtt for one robot's Hydro4/<device_id> topics.
 
-    Broker ACL only allows the exact host/report subscribe (wildcards denied).
+    Broker ACL denies wildcards. Exact topics that work: host/report, box/report,
+    notify (error-query replies), property/response, property/query, property/set.
     paho runs its own network thread; callbacks marshal onto the HA loop.
     """
 
@@ -248,11 +262,13 @@ class ChasingMqttClient:
         mqtt_password: str,
         on_status: Callable[[DeviceStatus], None],
         on_connection_change: Callable[[bool], None] | None = None,
+        on_errors: Callable[[list[dict]], None] | None = None,
     ) -> None:
         self._loop = loop
         self._device_id = device_id
         self._on_status = on_status
         self._on_connection_change = on_connection_change
+        self._on_errors = on_errors
         self._connected = False
 
         self._client = mqtt.Client(
@@ -284,6 +300,14 @@ class ChasingMqttClient:
     def _topic_get(self) -> str:
         return f"{TOPIC_PREFIX}/{self._device_id}/property/get"
 
+    @property
+    def _topic_query(self) -> str:
+        return f"{TOPIC_PREFIX}/{self._device_id}/property/query"
+
+    @property
+    def _topic_notify(self) -> str:
+        return f"{TOPIC_PREFIX}/{self._device_id}/notify"
+
     def _notify_connection(self, connected: bool) -> None:
         self._connected = connected
         if self._on_connection_change is None:
@@ -296,11 +320,17 @@ class ChasingMqttClient:
             self._notify_connection(False)
             return
 
-        # Exact topic only — Hydro4/<id>/# is ACL-denied.
+        # Exact topics only — Hydro4/<id>/# is ACL-denied.
         client.subscribe(self._topic_host_report, qos=1)
-        _LOGGER.info("CHASING MQTT connected; subscribed to %s", self._topic_host_report)
+        client.subscribe(self._topic_notify, qos=1)
+        _LOGGER.info(
+            "CHASING MQTT connected; subscribed to %s and %s",
+            self._topic_host_report,
+            self._topic_notify,
+        )
         self._notify_connection(True)
         self.request_status()
+        self.request_errors()
 
     def _handle_disconnect(self, client, userdata, flags, rc, properties=None) -> None:
         _LOGGER.warning("CHASING MQTT disconnected, rc=%s", rc)
@@ -314,9 +344,16 @@ class ChasingMqttClient:
             return
 
         data = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(data, dict) or "status" not in data:
+        if not isinstance(data, dict):
             return
-        self._loop.call_soon_threadsafe(self._on_status, DeviceStatus.from_payload(data))
+        if "status" in data:
+            self._loop.call_soon_threadsafe(self._on_status, DeviceStatus.from_payload(data))
+        error = data.get("error")
+        if isinstance(error, dict) and self._on_errors is not None:
+            items = error.get("list")
+            self._loop.call_soon_threadsafe(
+                self._on_errors, items if isinstance(items, list) else []
+            )
 
     def connect(self) -> None:
         """Blocking; call via hass.async_add_executor_job."""
@@ -347,6 +384,20 @@ class ChasingMqttClient:
                 _LOGGER.warning("CHASING MQTT get publish rc=%s", info.rc)
         except Exception:  # noqa: BLE001
             _LOGGER.exception("CHASING MQTT get publish failed")
+
+    def request_errors(self) -> None:
+        """Ask the cloud for the active error list (replies on notify)."""
+        query_payload = {
+            "msgId": f"{self._device_id}{int(time.time())}error",
+            "time": int(time.time()),
+            "data": {"error": 0},
+        }
+        try:
+            info = self._client.publish(self._topic_query, json.dumps(query_payload), qos=0)
+            if info.rc != mqtt.MQTT_ERR_SUCCESS:
+                _LOGGER.warning("CHASING MQTT error query publish rc=%s", info.rc)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("CHASING MQTT error query publish failed")
 
     def publish_command(self, data: dict) -> None:
         if not self.is_connected:

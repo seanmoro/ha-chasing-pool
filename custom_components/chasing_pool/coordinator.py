@@ -26,6 +26,7 @@ from .const import (
     CONF_PASSWORD,
     CONF_TOKEN,
     DOMAIN,
+    ERROR_CODE_FILTER_FULL,
     PRESENCE_UPDATE_SECONDS,
 )
 
@@ -54,11 +55,20 @@ class ChasingPoolCoordinator(DataUpdateCoordinator[DeviceStatus | None]):
         self.wifi_name: str | None = None
         self.sleeping: bool | None = None
         self._reauth_started = False
+        self.error_codes: list[int] = []
+        self.error_details: list[dict[str, Any]] = []
 
     @property
     def robot_available(self) -> bool:
         """True only when broker is up AND cloud says the robot is online."""
         return bool(self.mqtt_connected and self.cloud_online and self.data is not None)
+
+    @property
+    def filter_full(self) -> bool:
+        """True when cloud reports the GO3 'Filter basket fully loaded' error."""
+        if self.data is not None and self.data.filter_full_from_fault:
+            return True
+        return ERROR_CODE_FILTER_FULL in self.error_codes
 
     @callback
     def handle_status(self, status: DeviceStatus) -> None:
@@ -71,6 +81,32 @@ class ChasingPoolCoordinator(DataUpdateCoordinator[DeviceStatus | None]):
     def handle_mqtt_connection(self, connected: bool) -> None:
         self.mqtt_connected = connected
         # Force entity availability refresh even if DeviceStatus unchanged.
+        self.async_update_listeners()
+
+    @callback
+    def handle_errors(self, items: list[dict[str, Any]]) -> None:
+        """MQTT notify error.list from property/query {error: 0}."""
+        codes: list[int] = []
+        details: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            raw = item.get("code")
+            try:
+                code = int(raw)
+            except (TypeError, ValueError):
+                continue
+            codes.append(code)
+            details.append(
+                {
+                    "code": code,
+                    "code_hex": hex(code),
+                    "msg": item.get("msg"),
+                    "device": item.get("device"),
+                }
+            )
+        self.error_codes = codes
+        self.error_details = details
         self.async_update_listeners()
 
     async def async_setup(self) -> None:
@@ -89,6 +125,7 @@ class ChasingPoolCoordinator(DataUpdateCoordinator[DeviceStatus | None]):
                 mqtt_password=str(self.entry.data[CONF_MQTT_PASSWORD]),
                 on_status=self.handle_status,
                 on_connection_change=self.handle_mqtt_connection,
+                on_errors=self.handle_errors,
             )
             client.connect()
             return client
@@ -155,6 +192,7 @@ class ChasingPoolCoordinator(DataUpdateCoordinator[DeviceStatus | None]):
 
         if self.cloud_online and self.client is not None and self.client.is_connected:
             await self.hass.async_add_executor_job(self.client.request_status)
+            await self.hass.async_add_executor_job(self.client.request_errors)
 
         if not self.cloud_online:
             _LOGGER.debug(

@@ -58,6 +58,7 @@ Unofficial Home Assistant integration for **CHASING Hydro4** pool robots (PoolMa
 | Cleaning Duration | Minutes (especially for Custom) |
 | Cloud Online | True cloud presence |
 | Out of Water | Problem binary sensor |
+| Filter Full | Problem binary sensor (cloud error 0x42033C) |
 
 ## Troubleshooting
 

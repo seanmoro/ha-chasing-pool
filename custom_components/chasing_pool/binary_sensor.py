@@ -18,6 +18,7 @@ async def async_setup_entry(
     async_add_entities(
         [
             ChasingOutOfWaterBinarySensor(coordinator),
+            ChasingFilterFullBinarySensor(coordinator),
             ChasingCloudOnlineBinarySensor(coordinator),
         ]
     )
@@ -36,6 +37,33 @@ class ChasingOutOfWaterBinarySensor(ChasingPoolEntity, BinarySensorEntity):
         if self.coordinator.data is None:
             return None
         return self.coordinator.data.out_of_water
+
+
+class ChasingFilterFullBinarySensor(ChasingPoolEntity, BinarySensorEntity):
+    """True when CHASING reports error 0x42033C (filter basket fully loaded)."""
+
+    _attr_name = "Filter Full"
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+
+    def __init__(self, coordinator: ChasingPoolCoordinator) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.device_id}_filter_full"
+
+    @property
+    def is_on(self) -> bool | None:
+        if not self.coordinator.robot_available:
+            return None
+        return self.coordinator.filter_full
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object]:
+        fault = self.coordinator.data.fault_alarm if self.coordinator.data else -1
+        return {
+            "fault_alarm": fault,
+            "fault_alarm_hex": hex(fault) if fault >= 0 else None,
+            "error_codes": [hex(code) for code in self.coordinator.error_codes],
+            "errors": self.coordinator.error_details,
+        }
 
 
 class ChasingCloudOnlineBinarySensor(ChasingPoolEntity, BinarySensorEntity):

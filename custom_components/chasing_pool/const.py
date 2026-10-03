@@ -21,6 +21,9 @@ STATUS_CLEANING = 1
 STATUS_PAUSED = 2
 MODE_RETRIEVE = 6
 
+# PoolMate GO3 ToolsUtil.handleNewErrorCode — "Filter basket fully loaded".
+ERROR_CODE_FILTER_FULL = 0x42033C
+
 # Cleaning program names as shown in the CHASING app, in mode-value order (0-5).
 # Durations match the modesDuration preset list captured from the app
 # ([120, 60, 180, 120, 120, 5] minutes) for the first five; "Custom" duration
