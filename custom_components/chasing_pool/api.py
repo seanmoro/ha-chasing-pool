@@ -277,8 +277,8 @@ class ChasingMqttClient:
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
         )
         self._client.username_pw_set(mqtt_username, mqtt_password)
-        self._client.tls_set(cert_reqs=ssl.CERT_NONE)
-        self._client.tls_insecure_set(True)
+        # __init__ runs inside the executor job that builds the client.
+        self._client.tls_set_context(ssl.create_default_context())
         self._client.reconnect_delay_set(min_delay=1, max_delay=120)
         self._client.on_connect = self._handle_connect
         self._client.on_disconnect = self._handle_disconnect
