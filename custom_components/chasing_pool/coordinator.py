@@ -5,9 +5,15 @@ from datetime import timedelta
 import logging
 from typing import Any
 
+import aiohttp
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryNotReady,
+    HomeAssistantError,
+)
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -130,7 +136,12 @@ class ChasingPoolCoordinator(DataUpdateCoordinator[DeviceStatus | None]):
             client.connect()
             return client
 
-        self.client = await self.hass.async_add_executor_job(_create_and_connect)
+        try:
+            self.client = await self.hass.async_add_executor_job(_create_and_connect)
+        except OSError as err:
+            raise ConfigEntryNotReady(
+                f"Unable to connect to the CHASING MQTT broker: {err}"
+            ) from err
 
     async def async_shutdown_mqtt(self) -> None:
         client = self.client
@@ -151,7 +162,14 @@ class ChasingPoolCoordinator(DataUpdateCoordinator[DeviceStatus | None]):
             return False
 
         _LOGGER.info("CHASING token expired; refreshing login for %s", email)
-        creds = await self.rest.async_login(email, password)
+        try:
+            creds = await self.rest.async_login(email, password)
+        except ChasingAuthError as err:
+            # A stored password that no longer works must start reauth.
+            # Returning normally would skip that, because a password is present.
+            raise ConfigEntryAuthFailed(str(err)) from err
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise UpdateFailed(f"CHASING login failed: {err}") from err
         new_data = {
             **self.entry.data,
             CONF_TOKEN: creds.token,
@@ -160,7 +178,11 @@ class ChasingPoolCoordinator(DataUpdateCoordinator[DeviceStatus | None]):
         }
         self.hass.config_entries.async_update_entry(self.entry, data=new_data)
         self.rest.set_token(creds.token)
-        await self.async_reconnect_mqtt()
+        try:
+            await self.async_reconnect_mqtt()
+        except ConfigEntryNotReady as err:
+            # Entry is already set up; a broker blip should retry on the next poll.
+            raise UpdateFailed(str(err)) from err
         self._reauth_started = False
         return True
 
@@ -174,15 +196,26 @@ class ChasingPoolCoordinator(DataUpdateCoordinator[DeviceStatus | None]):
 
     async def _async_update_data(self) -> DeviceStatus | None:
         try:
-            await self.rest.async_check_token()
-            presence = await self.rest.async_get_presence(self.device_id)
+            try:
+                await self.rest.async_check_token()
+                presence = await self.rest.async_get_presence(self.device_id)
+            except ChasingAuthError as err:
+                await self._async_handle_auth_failure(err)
+                # If refresh succeeded, retry once.
+                await self.rest.async_check_token()
+                presence = await self.rest.async_get_presence(self.device_id)
         except ChasingAuthError as err:
-            await self._async_handle_auth_failure(err)
-            # If refresh succeeded, retry once.
-            await self.rest.async_check_token()
-            presence = await self.rest.async_get_presence(self.device_id)
+            raise ConfigEntryAuthFailed(str(err)) from err
         except ChasingApiError as err:
             raise UpdateFailed(str(err)) from err
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise UpdateFailed(f"CHASING cloud request failed: {err}") from err
+
+        if self.client is None:
+            try:
+                await self.async_ensure_mqtt()
+            except ConfigEntryNotReady as err:
+                raise UpdateFailed(str(err)) from err
 
         self.cloud_online = presence.online
         if presence.device_name:
