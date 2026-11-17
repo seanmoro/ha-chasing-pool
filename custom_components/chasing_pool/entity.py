@@ -23,10 +23,12 @@ class ChasingPoolEntity(CoordinatorEntity[ChasingPoolCoordinator]):
     @property
     def device_info(self) -> DeviceInfo:
         data = self.coordinator.data
+        name = self.coordinator.device_name or "CHASING Pool Robot"
+        model = "HYDRO6" if "hydro 6" in name.lower() or "hydro6" in name.lower() else "HYDRO4"
         return DeviceInfo(
             identifiers={(DOMAIN, self.coordinator.device_id)},
-            name=self.coordinator.device_name or "CHASING Pool Robot",
+            name=name,
             manufacturer="CHASING",
-            model="HYDRO4",
+            model=model,
             sw_version=data.fw_version if data else None,
         )
