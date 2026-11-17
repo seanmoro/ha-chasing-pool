@@ -116,7 +116,8 @@ class ChasingPoolCoordinator(DataUpdateCoordinator[DeviceStatus | None]):
         self.async_update_listeners()
 
     async def async_setup(self) -> None:
-        await self.async_ensure_mqtt()
+        # Connect MQTT from _async_update_data so a failed first refresh does
+        # not leave a client behind (setup failure skips async_unload_entry).
         await self.async_config_entry_first_refresh()
 
     async def async_ensure_mqtt(self) -> None:
