@@ -33,7 +33,9 @@ from .const import (
     CONF_TOKEN,
     DOMAIN,
     ERROR_CODE_FILTER_FULL,
+    MODE_RETRIEVE,
     PRESENCE_UPDATE_SECONDS,
+    STATUS_CLEANING,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -125,6 +127,8 @@ class ChasingPoolCoordinator(DataUpdateCoordinator[DeviceStatus | None]):
             return
 
         def _create_and_connect() -> ChasingMqttClient:
+            dev_name = (self.device_name or "").lower()
+            prefix = "Hydro6" if "hydro 6" in dev_name or "hydro6" in dev_name else "Hydro4"
             client = ChasingMqttClient(
                 loop=self.hass.loop,
                 device_id=self.device_id,
@@ -133,6 +137,7 @@ class ChasingPoolCoordinator(DataUpdateCoordinator[DeviceStatus | None]):
                 on_status=self.handle_status,
                 on_connection_change=self.handle_mqtt_connection,
                 on_errors=self.handle_errors,
+                topic_prefix=prefix,
             )
             client.connect()
             return client
@@ -244,7 +249,48 @@ class ChasingPoolCoordinator(DataUpdateCoordinator[DeviceStatus | None]):
                 "Pool robot is offline from CHASING cloud. "
                 "Wake it / reconnect Wi-Fi, then try again."
             )
+
+        updates: dict[str, int] = {}
+        if "shape" in data:
+            updates["shape"] = int(data["shape"])
+        if "mode" in data:
+            updates["mode"] = int(data["mode"])
+            # If returning to base, the robot enters cleaning status (status 1) to
+            # retrieve. Update status so is_returning is immediately True even if
+            # previously paused.
+            if updates["mode"] == MODE_RETRIEVE:
+                updates["status"] = STATUS_CLEANING
+        if "zone" in data:
+            updates["zone"] = int(data["zone"])
+        if "lightStrip" in data:
+            updates["light_strip"] = int(data["lightStrip"])
+        if "minutes" in data:
+            updates["minutes"] = int(data["minutes"])
+        if "status" in data:
+            updates["status"] = int(data["status"])
+
+        # Optimistically update local state immediately so UI changes are instant
+        # without waiting for the robot's 60-second periodic telemetry heartbeat.
+        optimistic = self.data
+        previous: dict[str, int] = {}
+        if optimistic is not None:
+            for attr, value in updates.items():
+                previous[attr] = getattr(optimistic, attr)
+                setattr(optimistic, attr, value)
+            self.async_set_updated_data(optimistic)
+
         try:
             await self.hass.async_add_executor_job(self.client.publish_command, data)
         except ChasingApiError as err:
+            # Only undo this command's own changes. If telemetry replaced
+            # self.data meanwhile, it is newer than our snapshot; leave it alone.
+            # Skip any field another command has changed since.
+            if optimistic is not None and self.data is optimistic:
+                reverted = False
+                for attr, old in previous.items():
+                    if getattr(optimistic, attr) == updates[attr]:
+                        setattr(optimistic, attr, old)
+                        reverted = True
+                if reverted:
+                    self.async_set_updated_data(optimistic)
             raise HomeAssistantError(str(err)) from err

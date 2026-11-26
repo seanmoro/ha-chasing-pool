@@ -207,21 +207,76 @@ class ChasingRestClient:
                 raise ChasingAuthError(body.get("msg", "check-token failed"))
 
     async def async_list_devices(self) -> list[dict]:
-        async with self._session.get(
-            f"{REST_BASE_URL}/v1/users/clients?type=1", headers=self._headers
-        ) as resp:
-            if resp.status == 401:
-                raise ChasingAuthError("clients returned HTTP 401")
-            if resp.status != 200:
-                raise ChasingApiError(f"clients returned HTTP {resp.status}")
-            body = await resp.json()
-            if body.get("code") != 0:
-                # Auth-ish failures often come as code != 0 with HTTP 200.
-                msg = str(body.get("msg", "clients failed"))
-                if "token" in msg.lower() or "auth" in msg.lower() or "login" in msg.lower():
-                    raise ChasingAuthError(msg)
-                raise ChasingApiError(msg)
-            return body.get("data", [])
+        all_devices = []
+        seen_ids = set()
+        errors: dict[int, Exception] = {}
+        transport_errors: set[int] = set()
+        any_success = False
+
+        # Query known device types: 2 (Hydro 6), 1 (Hydro 4), 0, 3, 4
+        for t in [2, 1, 0, 3, 4]:
+            url = f"{REST_BASE_URL}/v1/users/clients?type={t}"
+            try:
+                async with self._session.get(url, headers=self._headers) as resp:
+                    if resp.status == 401:
+                        raise ChasingAuthError("clients returned HTTP 401")
+                    if resp.status != 200:
+                        errors[t] = ChasingApiError(
+                            f"clients query {url} returned HTTP {resp.status}"
+                        )
+                        transport_errors.add(t)
+                        continue
+                    body = await resp.json()
+                    if body.get("code") != 0:
+                        msg = str(body.get("msg", "clients failed"))
+                        if (
+                            "token" in msg.lower()
+                            or "auth" in msg.lower()
+                            or "login" in msg.lower()
+                        ):
+                            raise ChasingAuthError(msg)
+                        errors[t] = ChasingApiError(msg)
+                        continue
+                    any_success = True
+                    data = body.get("data")
+                    if isinstance(data, list):
+                        for d in data:
+                            cid = d.get("clientId")
+                            if cid and cid not in seen_ids:
+                                seen_ids.add(cid)
+                                all_devices.append(d)
+            except ChasingAuthError:
+                raise
+            except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as e:
+                _LOGGER.warning("CHASING exception querying %s: %s", url, e)
+                errors[t] = e
+                transport_errors.add(t)
+
+        if errors:
+            # A failed lookup must not look like an absent device. Type 1 (Hydro 4)
+            # failing in any way raises, as before Hydro 6 support. Type 2
+            # (Hydro 6) raises on transport failures only, because an API-level
+            # "no such type" answer is expected for Hydro 4 accounts. Types 0, 3
+            # and 4 are exploratory and never fatal on their own.
+            fatal = next(
+                (
+                    t
+                    for t in (1, 2)
+                    if t in errors and (t == 1 or t in transport_errors)
+                ),
+                None,
+            )
+            if fatal is None and not any_success:
+                fatal = next(iter(errors))
+            if fatal is not None:
+                err = errors[fatal]
+                if isinstance(err, ChasingApiError):
+                    raise err
+                raise ChasingApiError(
+                    f"Unable to discover CHASING devices: {err}"
+                ) from err
+
+        return all_devices
 
     async def async_get_presence(self, device_id: str) -> DevicePresence:
         devices = await self.async_list_devices()
@@ -263,9 +318,11 @@ class ChasingMqttClient:
         on_status: Callable[[DeviceStatus], None],
         on_connection_change: Callable[[bool], None] | None = None,
         on_errors: Callable[[list[dict]], None] | None = None,
+        topic_prefix: str = TOPIC_PREFIX,
     ) -> None:
         self._loop = loop
         self._device_id = device_id
+        self._topic_prefix = topic_prefix
         self._on_status = on_status
         self._on_connection_change = on_connection_change
         self._on_errors = on_errors
@@ -290,23 +347,23 @@ class ChasingMqttClient:
 
     @property
     def _topic_host_report(self) -> str:
-        return f"{TOPIC_PREFIX}/{self._device_id}/property/host/report"
+        return f"{self._topic_prefix}/{self._device_id}/property/host/report"
 
     @property
     def _topic_set(self) -> str:
-        return f"{TOPIC_PREFIX}/{self._device_id}/property/set"
+        return f"{self._topic_prefix}/{self._device_id}/property/set"
 
     @property
     def _topic_get(self) -> str:
-        return f"{TOPIC_PREFIX}/{self._device_id}/property/get"
+        return f"{self._topic_prefix}/{self._device_id}/property/get"
 
     @property
     def _topic_query(self) -> str:
-        return f"{TOPIC_PREFIX}/{self._device_id}/property/query"
+        return f"{self._topic_prefix}/{self._device_id}/property/query"
 
     @property
     def _topic_notify(self) -> str:
-        return f"{TOPIC_PREFIX}/{self._device_id}/notify"
+        return f"{self._topic_prefix}/{self._device_id}/notify"
 
     def _notify_connection(self, connected: bool) -> None:
         self._connected = connected
@@ -320,13 +377,18 @@ class ChasingMqttClient:
             self._notify_connection(False)
             return
 
-        # Exact topics only — Hydro4/<id>/# is ACL-denied.
-        client.subscribe(self._topic_host_report, qos=1)
-        client.subscribe(self._topic_notify, qos=1)
+        # Subscribe to active prefix and fallback
+        prefixes = [self._topic_prefix]
+        for p in ["Hydro6", "Hydro4"]:
+            if p not in prefixes:
+                prefixes.append(p)
+        for p in prefixes:
+            client.subscribe(f"{p}/{self._device_id}/property/host/report", qos=1)
+            client.subscribe(f"{p}/{self._device_id}/notify", qos=1)
         _LOGGER.info(
-            "CHASING MQTT connected; subscribed to %s and %s",
-            self._topic_host_report,
-            self._topic_notify,
+            "CHASING MQTT connected; subscribed for %s with prefixes %s",
+            self._device_id,
+            prefixes,
         )
         self._notify_connection(True)
         self.request_status()
@@ -343,6 +405,10 @@ class ChasingMqttClient:
             _LOGGER.warning("CHASING MQTT non-JSON on %s", msg.topic)
             return
 
+        if "/" in msg.topic:
+            pfx = msg.topic.split("/", 1)[0]
+            if pfx in ("Hydro4", "Hydro6"):
+                self._topic_prefix = pfx
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, dict):
             return
